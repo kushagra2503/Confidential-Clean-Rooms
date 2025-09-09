@@ -1,0 +1,102 @@
+[
+    {
+        "name": "ABC Securities",
+        "reg_id": "INZ00012345",
+        "status": "Active"
+    },
+    {
+        "name": "XYZ Advisors",
+        "reg_id": "INZ00067890",
+        "status": "Revoked"
+    },
+    {
+        "name": "PQR Capital",
+        "reg_id": "INZ00011223",
+        "status": "Active"
+    },
+    {
+        "name": "LMN Investments",
+        "reg_id": "INZ00033445",
+        "status": "Suspended"
+    },
+    {
+        "name": "OPQ Financial Services",
+        "reg_id": "INZ00055667",
+        "status": "Active"
+    },
+    {
+        "name": "RST Wealth Management",
+        "reg_id": "INZ00077889",
+        "status": "Revoked"
+    },
+    {
+        "name": "UVW Securities Pvt Ltd",
+        "reg_id": "INZ00099001",
+        "status": "Active"
+    },
+    {
+        "name": "MNO Advisory LLP",
+        "reg_id": "INZ00022334",
+        "status": "Active"
+    },
+    {
+        "name": "JKL Broking",
+        "reg_id": "INZ00044556",
+        "status": "Active"
+    },
+    {
+        "name": "DEF Asset Managers",
+        "reg_id": "INZ00066778",
+        "status": "Revoked"
+    },
+    {
+        "name": "GHI Investments",
+        "reg_id": "INZ00088990",
+        "status": "Active"
+    },
+    {
+        "name": "TUV Capital Advisors",
+        "reg_id": "INZ00010112",
+        "status": "Suspended"
+    },
+    {
+        "name": "WXY Holdings",
+        "reg_id": "INZ00013141",
+        "status": "Active"
+    },
+    {
+        "name": "ZAB Securities",
+        "reg_id": "INZ00015161",
+        "status": "Active"
+    },
+    {
+        "name": "NOP Advisors",
+        "reg_id": "INZ00017181",
+        "status": "Revoked"
+    },
+    {
+        "name": "QRS Investment Partners",
+        "reg_id": "INZ00019201",
+        "status": "Active"
+    },
+    {
+        "name": "CDE Capital Pvt Ltd",
+        "reg_id": "INZ00020221",
+        "status": "Active"
+    },
+    {
+        "name": "FGH Wealth LLP",
+        "reg_id": "INZ00022241",
+        "status": "Suspended"
+    },
+    {
+        "name": "IJK Financial Consultants",
+        "reg_id": "INZ00024261",
+        "status": "Active"
+    },
+    {
+        "name": "LMO Securities",
+        "reg_id": "INZ00026281",
+        "status": "Active"
+    }
+]

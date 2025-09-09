@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+google-cloud-storage
+cryptography
+papermill
+nbformat
+pandas
+numpy
+scikit-learn

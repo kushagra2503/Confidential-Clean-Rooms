@@ -1,0 +1,7 @@
+streamlit
+requests
+cryptography
+google-cloud-storage
+jupyter
+ipykernel
+pandas

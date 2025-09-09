@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+google-cloud-bigquery
+google-cloud-storage
+pydantic
+papermill
+nbformat
+ipykernel
+notebook
+pandas
+pyarrow
+gcsfs
+requests
