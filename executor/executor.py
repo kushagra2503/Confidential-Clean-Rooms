@@ -14,15 +14,49 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import nbformat
 import papermill as pm
+from collections import defaultdict
+import threading, time
+from google.oauth2 import service_account
 
 # ---------- Configuration ----------
-RESULTS_BUCKET = os.environ.get("RESULTS_BUCKET", "clean-room-exp-cleanroom-demo")
+RESULTS_BUCKET = os.environ.get("RESULTS_BUCKET", "yellowsense-technologies-cleanroom")
 # Optionally restrict allowed GCS buckets/prefixes for security
 ALLOWED_SOURCE_BUCKETS = None  # set to list like ["client-a-bucket", "client-b-bucket"] if desired
+
+# ---------------------------LOCAL TESTING CONFIG---------------------------
+# SA_KEY_PATH = os.path.join(os.path.dirname(__file__), "yellowsense-technologies-17f4c4e3ed2c.json")
+SA_KEY_PATH = r"..\orchestrator\yellowsense-technologies-17f4c4e3ed2c.json"
+creds = service_account.Credentials.from_service_account_file(SA_KEY_PATH)
+# Use these credentials when creating GCS clients
+storage_client = storage.Client(credentials=creds)
+# --------------------------------------------------------------------------
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tee-executor")
+
+# Store logs in memory: { workflow_id: [log lines] }
+WORKFLOW_LOGS = defaultdict(list)
+LOG_LOCK = threading.Lock()
+
+def append_log(workflow_id, msg):
+    with LOG_LOCK:
+        WORKFLOW_LOGS[workflow_id].append(msg)
+    log.info(msg)  # still send to console
+
+def tail_pm_logs(log_file, workflow_id):
+    """ Continuously read papermill logs while notebook executes. """
+    try:
+        with open(log_file, "r") as f:
+            f.seek(0, io.SEEK_END)  # Start from end of file
+            while True:
+                line = f.readline()
+                if line:
+                    append_log(workflow_id, f"[pm] {line.strip()}")
+                else:
+                    time.sleep(0.5)
+    except Exception as e:
+        append_log(workflow_id, f"[pm-logger-error] {e}")
 
 # ---------- FastAPI app ----------
 app = FastAPI(title="TEE Executor (Confidential VM)")
@@ -37,7 +71,7 @@ _pub_pem = _priv_key.public_key().public_bytes(
 
 
 # ---------- Storage client ----------
-storage_client = storage.Client()
+# storage_client = storage.Client()
 
 
 # ---------- Pydantic models ----------
@@ -81,15 +115,30 @@ def upload_blob_from_file(gs_uri: str, local_path: str):
     blob.upload_from_filename(local_path)
     return f"gs://{bucket}/{obj}"
 
+# def list_result_blob_under_prefix(result_base: str):
+#     # result_base is gs://bucket/path/to/result (no extension)
+#     bucket, prefix = parse_gs_uri(result_base)
+#     # prefix may be like results/<workflow>/result
+#     # we'll look for all objects that start with prefix
+#     blobs = list(storage_client.bucket(bucket).list_blobs(prefix=os.path.dirname(prefix)))
+#     # choose those that match the result_base prefix (start with the base name)
+#     base_name = os.path.basename(prefix)
+#     candidates = [b for b in blobs if os.path.basename(b.name).startswith(base_name)]
+#     return candidates
+
 def list_result_blob_under_prefix(result_base: str):
-    # result_base is gs://bucket/path/to/result (no extension)
+    """
+    Correctly lists all result blobs uploaded by the notebook.
+    The notebook uploader puts files *under* the result_base prefix.
+    """
     bucket, prefix = parse_gs_uri(result_base)
-    # prefix may be like results/<workflow>/result
-    # we'll look for all objects that start with prefix
-    blobs = list(storage_client.bucket(bucket).list_blobs(prefix=os.path.dirname(prefix)))
-    # choose those that match the result_base prefix (start with the base name)
-    base_name = os.path.basename(prefix)
-    candidates = [b for b in blobs if os.path.basename(b.name).startswith(base_name)]
+    # The prefix is now the "folder" where results are, e.g., "results/<workflow_id>/result/"
+    # We list all blobs within that prefix.
+    blobs = list(storage_client.bucket(bucket).list_blobs(prefix=prefix))
+    
+    # Return all candidates found under the prefix.
+    # We filter out any potential "directory placeholder" objects if they exist.
+    candidates = [b for b in blobs if not b.name.endswith('/')]
     return candidates
 
 # ---------- Attestation endpoint ----------
@@ -136,69 +185,77 @@ def get_attestation_token(pub_pem: str) -> str:
     return fake_token
 
 
-# ---------- Core execution endpoint ----------
+# Updated 'execute' function with os.chdir()
 @app.post("/execute")
 def execute(req: ExecuteRequest = Body(...)):
     """
     Main execution API. Expects:
-      - workload_gcs: path to uploaded notebooks (original user notebook)
-      - datasets: list of DatasetSpec, each containing ciphertext and wrapped DEK GCS paths
-      - result_base: a GCS prefix (no extension) where result.* should be uploaded
-      - executed_notebook_base: a GCS prefix base to store executed notebook (no extension)
+      - datasets: list of DatasetSpec (each owner may contribute multiple datasets)
+      - result_base: gs://bucket/results/<workflow_id>/result
+      - executed_notebook_base: gs://bucket/results/<workflow_id>/executed
+    NOTE: workload is now fixed (bundled inside the executor).
     """
     workflow_id = req.workflow_id
     log.info(f"Starting execution for workflow {workflow_id}")
+    append_log(workflow_id, f"Starting execution for workflow {workflow_id}")
 
     # 1) create working directory
     workdir = tempfile.mkdtemp(prefix=f"wf_{workflow_id}_")
     log.info(f"Workdir: {workdir}")
+    append_log(workflow_id, f"Workdir: {workdir}")
+
+    # Store the original working directory
+    original_cwd = os.getcwd()
 
     try:
-        # 2) download workload notebook
-        bucket, obj = parse_gs_uri(req.workload_gcs)
-        workload_local = os.path.join(workdir, "workload.ipynb")
-        storage_client.bucket(bucket).blob(obj).download_to_filename(workload_local)
-        log.info("Downloaded workload notebook")
+        # Change the working directory so the notebook can find the files
+        os.chdir(workdir)
 
-        # 3) for each dataset: download wrapped_dek & ciphertext, unwrap, decrypt and write plaintext file
-        plaintext_paths = []
+        # 2) download fixed workload from GCS into workdir
+        fixed_workload_gcs = "gs://yellowsense-technologies-cleanroom/workloads/fraud-detector.ipynb"
+        bucket, obj = parse_gs_uri(fixed_workload_gcs)
+        workload_local = os.path.join(workdir, "fraud-detector.ipynb")
+        storage_client.bucket(bucket).blob(obj).download_to_filename(workload_local)
+
+        log.info(f"Downloaded fixed workload to {workload_local}")
+        append_log(workflow_id, f"Downloaded fixed workload to {workload_local}")
+        
+        # 3) decrypt all datasets
+        plaintext_paths = {}
         for ds in req.datasets:
             owner = ds.owner
-            log.info(f"Processing dataset of owner={owner}")
+            log.info(f"Processing dataset for owner={owner}")
+            append_log(workflow_id, f"Processing dataset for owner={owner}")
             wrapped_dek_bytes = download_blob_bytes(ds.wrapped_dek_gcs)
             ciphertext_bytes = download_blob_bytes(ds.ciphertext_gcs)
 
-            # unwrap dek using private key (RSA-OAEP)
-            try:
-                dek = _priv_key.decrypt(
-                    wrapped_dek_bytes,
-                    padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-                )
-            except Exception as e:
-                log.exception("Failed to unwrap DEK")
-                raise HTTPException(status_code=500, detail=f"Failed to unwrap DEK for {owner}: {e}")
+            # unwrap DEK
+            dek = _priv_key.decrypt(
+                wrapped_dek_bytes,
+                padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+            )
 
-            # decrypt AES-GCM (we expect nonce||ciphertext stored by client)
-            if len(ciphertext_bytes) < 12:
-                raise HTTPException(status_code=400, detail="ciphertext too short (expected nonce+ct)")
-
-            nonce = ciphertext_bytes[:12]
-            ct = ciphertext_bytes[12:]
+            # AES-GCM decrypt
+            nonce, ct = ciphertext_bytes[:12], ciphertext_bytes[12:]
             aesgcm = AESGCM(dek)
-            try:
-                plaintext = aesgcm.decrypt(nonce, ct, None)
-            except Exception as e:
-                log.exception("AES-GCM decrypt failed")
-                raise HTTPException(status_code=500, detail=f"AES-GCM decrypt failed for {owner}: {e}")
+            plaintext = aesgcm.decrypt(nonce, ct, None)
 
-            # write plaintext to a local file (simulate client local file)
-            local_path = os.path.join(workdir, f"{owner}_dataset.csv")
+            # get original filename from GCS object path
+            _, obj_path = parse_gs_uri(ds.ciphertext_gcs)
+            filename = os.path.basename(obj_path)  # preserve "my_data.csv"
+
+            # write plaintext directly into workdir (same folder as workload)
+            # The files are now saved in the new CWD
+            local_path = filename
             with open(local_path, "wb") as f:
                 f.write(plaintext)
-            plaintext_paths.append(local_path)
+
+            # store paths grouped by owner
+            plaintext_paths.setdefault(owner, []).append(local_path)
             log.info(f"Wrote plaintext dataset for {owner} to {local_path}")
 
-        # 4) prepare (inject) notebook: insert parameters cell with plaintext local paths and result_base
+        # 4) inject parameters & result uploader
+        # Note: The paths injected are now relative to the workdir, which is the CWD.
         prepared_nb_path = os.path.join(workdir, "prepared_workload.ipynb")
         inject_params_and_result_uploader(
             input_nb=workload_local,
@@ -209,115 +266,162 @@ def execute(req: ExecuteRequest = Body(...)):
         log.info("Prepared notebook with injected parameters + uploader")
 
         # 5) execute notebook with papermill (kernel_name=None runs in-process)
-        executed_nb_local = os.path.join(workdir, "executed.ipynb")
+        executed_nb_local = "executed.ipynb" # path is relative now
+        stdout_log = "pm_output.log" # path is relative now
+        
+        # Ensure the log file exists before tailing
+        open(stdout_log, "w").close()
+
+        # Start background thread to stream logs
+        threading.Thread(
+            target=tail_pm_logs,
+            args=(stdout_log, workflow_id),
+            daemon=True
+        ).start()
+
         log.info("Executing notebook (this runs inside the TEE process)")
-        pm.execute_notebook(input_path=prepared_nb_path, output_path=executed_nb_local, kernel_name="python3")
+
+        # Open log file handle and stream papermill output into it
+        with open(stdout_log, "w", buffering=1, encoding="utf-8") as stdout_f:
+            pm.execute_notebook(
+                input_path=prepared_nb_path,
+                output_path=executed_nb_local,
+                kernel_name="python3",
+                stdout_file=stdout_f,  # file handle instead of string path
+            )
+        
         log.info("Notebook executed")
+        append_log(workflow_id, "Notebook executed")
 
         # 6) upload executed notebook
         executed_target = req.executed_notebook_base + ".ipynb"
         upload_blob_from_file(executed_target, executed_nb_local)
         log.info(f"Uploaded executed notebook to {executed_target}")
 
-        # 7) the injected uploader in the notebook should have uploaded a result.* to GCS under result_base.
-        #    Find the actual result blob by listing the prefix and choosing the first match that starts with result_base name
+        # 7) locate result.* file
+        # candidates = list_result_blob_under_prefix(req.result_base)
+        # if not candidates:
+        #     raise HTTPException(status_code=500, detail="No result file found in results prefix after execution")
+
+        # chosen = next(
+        #     (b for b in candidates if os.path.basename(b.name).startswith(os.path.basename(parse_gs_uri(req.result_base)[1]))),
+        #     None
+        # )
+        # if not chosen:
+        #     raise HTTPException(status_code=500, detail="No matching result file found")
+
+        # result_gcs_path = f"gs://{chosen.bucket.name}/{chosen.name}"
+        # ext = os.path.splitext(chosen.name)[1].lstrip(".")
+
+        # return {
+        #     "status": "success",
+        #     "workflow_id": workflow_id,
+        #     "executed_notebook_path": executed_target,
+        #     "result_path": result_gcs_path,
+        #     "format": ext
+        # }
+
         candidates = list_result_blob_under_prefix(req.result_base)
         if not candidates:
-            raise HTTPException(status_code=500, detail="No result file found in results prefix after execution")
-        # pick the candidate whose name starts with the base filename
-        base_bucket, base_obj = parse_gs_uri(req.result_base)
-        base_name = os.path.basename(base_obj)
-        chosen = None
-        for b in candidates:
-            if os.path.basename(b.name).startswith(base_name):
-                chosen = b
-                break
-        if not chosen:
-            raise HTTPException(status_code=500, detail="No matching result file found")
+            append_log(workflow_id, "Execution finished, but no result files were found in the 'results/' output directory.")
+            raise HTTPException(status_code=500, detail="Notebook executed, but no result files were uploaded.")
 
-        result_gcs_path = f"gs://{chosen.bucket.name}/{chosen.name}"
-        ext = os.path.splitext(chosen.name)[1].lstrip(".")
-        log.info(f"Result found: {result_gcs_path} (format={ext})")
+        # Create a list of all found GCS paths
+        result_gcs_paths = [f"gs://{blob.bucket.name}/{blob.name}" for blob in candidates]
+        log.info(f"Found {len(result_gcs_paths)} result file(s): {result_gcs_paths}")
+        append_log(workflow_id, f"Found {len(result_gcs_paths)} result file(s).")
 
-        # return result metadata to orchestrator
         return {
             "status": "success",
             "workflow_id": workflow_id,
             "executed_notebook_path": executed_target,
-            "result_path": result_gcs_path,
-            "format": ext
+            "result_paths": result_gcs_paths  # <-- Key is now plural: "result_paths"
         }
 
-    except HTTPException:
-        raise
     except Exception as e:
         log.exception("Execution failed")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # best-effort cleanup local files (plaintext should be purged)
         try:
-            for root, dirs, files in os.walk(workdir):
+            # Change back to the original working directory
+            os.chdir(original_cwd)
+            for root, _, files in os.walk(workdir):
                 for name in files:
-                    try:
-                        os.remove(os.path.join(root, name))
-                    except Exception:
-                        pass
+                    os.remove(os.path.join(root, name))
             os.rmdir(workdir)
         except Exception:
             pass
 
-
-# ---------- Notebook injection helpers ----------
-def inject_params_and_result_uploader(input_nb: str, output_nb: str, dataset_local_paths: List[str], result_base: str):
+def inject_params_and_result_uploader(input_nb: str, output_nb: str,
+                                      dataset_local_paths: List[str], result_base: str):
     """
-    Reads input notebook, injects a parameters cell (tagged 'parameters') at top that sets
-    variables client_paths = [path1, path2, ...] and result_base variable.
-    Appends a result uploader cell that will look for 'result.*' files and upload to GCS.
+    Reads input notebook, injects a parameters cell and a result uploader cell.
+    Ensures a `model/` folder is created for trained models.
     """
     nb = nbformat.read(input_nb, as_version=4)
 
-    # Build parameters source
-    # Expose dataset_local_paths as a Python list variable named `client_local_paths`
+    # Parameters cell
     dataset_list_py = "[" + ", ".join([f'r"{p}"' for p in dataset_local_paths]) + "]"
     params_source = f'''# Parameters
 client_local_paths = {dataset_list_py}
 result_base = r"{result_base}"
-clientA_path = client_local_paths[0]  # path to ClientA's plaintext dataset
-clientB_path = client_local_paths[1]  # path to ClientB's
-ClientC_path = client_local_paths[2]  # path to ClientC's
+
+SA_KEY_PATH = f"{SA_KEY_PATH}"
+
+# Ensure a model directory exists for saving artifacts
+import os
+os.makedirs("results", exist_ok=True)
+os.makedirs("model", exist_ok=True)
 '''
     params_cell = nbformat.v4.new_code_cell(source=params_source)
     params_cell.metadata["tags"] = ["parameters"]
     nb.cells.insert(0, params_cell)
 
-    # Append dynamic result uploader cell
+    # Uploader cell
     uploader_source = r'''
 # Dynamic result uploader injected by executor (DO NOT MODIFY)
-import os
+import os, shutil
 from google.cloud import storage
-import json
+from google.oauth2 import service_account
 
-# Find a file named result.* written by the notebook
-result_file = None
-for fname in os.listdir("."):
-    if fname.startswith("result.") and os.path.isfile(fname):
-        result_file = fname
-        break
+# storage_client = storage.Client()
 
-if result_file is None:
-    raise RuntimeError("No result.* file found in working directory")
+if os.path.exists(SA_KEY_PATH):
+    creds = service_account.Credentials.from_service_account_file(SA_KEY_PATH)
+    storage_client = storage.Client(credentials=creds)
+else:
+    storage_client = storage.Client()  # fallback to default
 
-# Determine extension
-_, ext = os.path.splitext(result_file)
-gcs_target = result_base + ext
-
-# Upload file to GCS
-storage_client = storage.Client()
 bucket_name, blob_path = result_base[5:].split("/", 1)
 bucket = storage_client.bucket(bucket_name)
-blob = bucket.blob(blob_path + ext)
-blob.upload_from_filename(result_file)
-print(f"Uploaded {result_file} to {gcs_target}")
+
+# ---- Upload everything inside results/ ----
+results_dir = "results"
+if os.path.isdir(results_dir):
+    uploaded_files = []
+    for root, _, files in os.walk(results_dir):
+        for fname in files:
+            local_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(local_path, results_dir)
+            gcs_target = result_base.rstrip("/") + "/" + rel_path.replace("\\", "/")
+            bucket.blob(gcs_target[5 + len(bucket_name) + 1:]).upload_from_filename(local_path)
+            uploaded_files.append(gcs_target)
+            print(f"Uploaded {local_path} → {gcs_target}")
+    if not uploaded_files:
+        print("No files found inside results/ directory.")
+else:
+    print("No results/ directory found; skipping upload.")
+
+# ---- Upload trained model as zip ----
+model_dir = "model"
+if os.path.isdir(model_dir) and os.listdir(model_dir):  # only if not empty
+    zip_name = "trained_model.zip"
+    shutil.make_archive("trained_model", "zip", model_dir)
+    gcs_model = result_base + "_model.zip"
+    bucket.blob(blob_path + "_model.zip").upload_from_filename(zip_name)
+    print(f"Uploaded model zip to {gcs_model}")
+else:
+    print("No model artifacts found to upload.")
 '''
     uploader_cell = nbformat.v4.new_code_cell(source=uploader_source)
     nb.cells.append(uploader_cell)
@@ -325,6 +429,12 @@ print(f"Uploaded {result_file} to {gcs_target}")
     with open(output_nb, "w", encoding="utf-8") as f:
         nbformat.write(nb, f)
 
+# Add this endpoint to executor.py
+@app.get("/logs/{workflow_id}")
+def get_workflow_logs(workflow_id: str):
+    with LOG_LOCK:
+        logs = WORKFLOW_LOGS.get(workflow_id, [])
+    return {"logs": logs}
 
 # ---------- Run server ----------
 if __name__ == "__main__":

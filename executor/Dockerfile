@@ -28,8 +28,8 @@ COPY executor.py /app/executor.py
 EXPOSE 8443
 
 # Runtime env defaults (can be overridden by gcloud)
-ENV RESULTS_BUCKET=clean-room-exp-cleanroom-demo
-ENV GCLOUD_PROJECT=clean-room-exp
+ENV RESULTS_BUCKET=yellowsense-technologies-cleanroom
+ENV GCLOUD_PROJECT=yellowsense-technologies
 
 # Run uvicorn
 CMD ["uvicorn", "executor:app", "--host", "0.0.0.0", "--port", "8443", "--workers", "1", "--loop", "asyncio"]

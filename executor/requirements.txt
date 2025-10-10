@@ -7,3 +7,5 @@ nbformat
 pandas
 numpy
 scikit-learn
+imblearn
+lightgbm
