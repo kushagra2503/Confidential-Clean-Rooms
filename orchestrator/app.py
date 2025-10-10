@@ -17,35 +17,33 @@ bq_client = bigquery.Client()
 storage_client = storage.Client()
 TABLE_ID = None
 APPROVAL_TABLE_ID = None
-PROJECT_ID = "clean-room-exp"
+PROJECT_ID = "yellowsense-technologies"
 DATASET = "cleanroom"
-BUCKET = f"{PROJECT_ID}-cleanroom-demo"
+BUCKET = f"{PROJECT_ID}-cleanroom"
 
-EXECUTOR_URL = "http://35.226.47.93:8443"
+EXECUTOR_URL = "http://localhost:8443"
 
 # 👇 Add the dedicated signer service account email
 
 #---------------------------CHANGES FOR LOCAL TESTING---------------------------
 # SIGNER_EMAIL = "cleanroom-signer@clean-room-exp.iam.gserviceaccount.com" <- for cloud run
 
-SA_KEY_PATH = os.path.join(os.path.dirname(__file__), "signer-sa-key.json")  # <- for local testing
+SA_KEY_PATH = os.path.join(os.path.dirname(__file__), "yellowsense-technologies-17f4c4e3ed2c.json")  # <- for local testing
 creds = service_account.Credentials.from_service_account_file(SA_KEY_PATH)                # <- for local testing  
 #--------------------------------------------------------------------------------
+
+FIXED_WORKLOAD_PATH = f"gs://yellowsense-technologies-cleanroom/workloads/model-1a.ipynb"
 
 @app.post("/workflows")
 def create_workflow(workflow_id: str = Query(...), 
                     creator: str = Query(...), 
-                    collaborator: List[str] = Query(...),
-                    workload_path: str = Query(...),
-                    dataset_path: str = Query(...)):
-    # workflow_id = str(uuid.uuid4())
+                    collaborator: List[str] = Query(...)):
     rows = [
         {
             "workflow_id": workflow_id,
             "creator": creator,
             "collaborator": collaborator,
-            "workload_path": workload_path,
-            "dataset_path": dataset_path,
+            "workload_path": FIXED_WORKLOAD_PATH,
             "status": "PENDING_APPROVAL",
             "created_at": f"{datetime.datetime.now()}"
         }
@@ -110,10 +108,12 @@ def reject_workflow(workflow_id: str, client_id: str = Query(...)):
 @app.post("/upload-url")
 def generate_upload_url(
     workflow_id: str = Query(...),
+    dataset_id: str = Query(...),
+    filename: str = Query(...),
     file_type: str = Query(..., regex="^(dataset|workload|key)$"),
     owner: str = Query(...)
 ):
-    object_name = f"{file_type}s/{owner}/{workflow_id}"
+    object_name = f"{file_type}s/{owner}/{workflow_id}/{dataset_id}/{filename}"
     bucket = storage_client.bucket(BUCKET)
     blob = bucket.blob(object_name)
 
@@ -146,7 +146,8 @@ def generate_upload_url(
         "workflow_id": workflow_id,
         "owner": owner,
         "gcs_path": f"gs://{BUCKET}/{object_name}",
-        "created_at": datetime.datetime.now().isoformat()
+        "created_at": datetime.datetime.now().isoformat(),
+        "dataset_id": dataset_id
     }
     errors = bq_client.insert_rows_json(table, [row])
     if errors:
@@ -198,104 +199,48 @@ def generate_download_url(
 #  Runner Endpoint
 # ---------------------------
 
-def get_latest_dataset(workflow_id: str, owner: str) -> str:
-    owner = owner
+def get_all_datasets(workflow_id: str, owner: str) -> list:
     query = f"""
-        SELECT gcs_path
+        SELECT dataset_id, gcs_path
         FROM `{PROJECT_ID}.{DATASET}.{owner}_datasets`
         WHERE workflow_id = @workflow_id AND owner = @owner
         ORDER BY created_at DESC
-        LIMIT 1
     """
     job = bq_client.query(
         query,
         job_config=bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("workflow_id", "STRING", workflow_id),
-                              bigquery.ScalarQueryParameter("owner", "STRING", owner)]
+            query_parameters=[
+                bigquery.ScalarQueryParameter("workflow_id", "STRING", workflow_id),
+                bigquery.ScalarQueryParameter("owner", "STRING", owner),
+            ]
         ),
     )
-    rows = list(job.result())
-    if not rows:
-        raise HTTPException(status_code=404, detail=f"No dataset found for {owner}")
-    return rows[0]["gcs_path"]
+    return list(job.result())
 
-def get_latest_key(workflow_id: str, owner: str) -> str:
-    owner = owner
+def get_all_keys(workflow_id: str, owner: str) -> list:
     query = f"""
-        SELECT gcs_path
+        SELECT dataset_id, gcs_path
         FROM `{PROJECT_ID}.{DATASET}.{owner}_keys`
         WHERE workflow_id = @workflow_id AND owner = @owner
         ORDER BY created_at DESC
-        LIMIT 1
     """
     job = bq_client.query(
         query,
         job_config=bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("workflow_id", "STRING", workflow_id),
-                              bigquery.ScalarQueryParameter("owner", "STRING", owner)]
+            query_parameters=[
+                bigquery.ScalarQueryParameter("workflow_id", "STRING", workflow_id),
+                bigquery.ScalarQueryParameter("owner", "STRING", owner),
+            ]
         ),
     )
-    rows = list(job.result())
-    if not rows:
-        raise HTTPException(status_code=404, detail=f"No dataset found for {owner}")
-    return rows[0]["gcs_path"]
-
-def prepare_notebook(input_path, output_path, clientA_path, clientB_path, result_base):
-    nb = nbformat.read(open(input_path), as_version=4)
-
-    # 1. Inject parameters cell at top
-    params_cell = nbformat.v4.new_code_cell(
-        source=f"""# Parameters
-clientA_path = "{clientA_path}"
-clientB_path = "{clientB_path}"
-result_base = "{result_base}"
-"""
-    )
-    params_cell.metadata["tags"] = ["parameters"]
-    nb.cells.insert(0, params_cell)
-
-    # 2. Inject result-upload cell at end
-    result_cell = nbformat.v4.new_code_cell(
-        source="""# Upload results to GCS
-import os
-from google.cloud import storage
-
-# Look for any result.* file created by the notebook
-result_file = None
-for fname in os.listdir("."):
-    if fname.startswith("result.") and os.path.isfile(fname):
-        result_file = fname
-        break
-
-if result_file is None:
-    raise RuntimeError("❌ No result file found (expected result.csv, result.json, result.txt, etc.)")
-
-# Build GCS target path using result_path but swap extension dynamically
-_, ext = os.path.splitext(result_file)
-# gcs_target = result_path.rsplit(".", 1)[0] + ext
-gcs_target = result_base + ext
-
-storage_client = storage.Client()
-bucket_name, blob_path = result_base[5:].split("/", 1)
-bucket = storage_client.bucket(bucket_name)
-blob = bucket.blob(blob_path + ext)
-
-blob.upload_from_filename(result_file)
-print(f"✅ Uploaded {result_file} to {gcs_target}")
-"""
-    )
-    nb.cells.append(result_cell)
-
-    # Save prepared notebook
-    with open(output_path, "w") as f:
-        nbformat.write(nb, f)
+    return list(job.result())
 
 @app.post("/workflows/{workflow_id}/run")
 def run_notebook(workflow_id: str, creator: str=Query(...), collaborators: List[str]=Query(...)):
     print(collaborators)
     for collaborator in collaborators:
-        if not collaborator.startswith("Client"):
-            raise HTTPException(status_code=400, detail=f"Invalid collaborator ID: {collaborator}")
+        # if not collaborator.startswith("Client"):
+        #     raise HTTPException(status_code=400, detail=f"Invalid collaborator ID: {collaborator}")
         
         query = f"""
             SELECT *
@@ -335,83 +280,33 @@ def run_notebook(workflow_id: str, creator: str=Query(...), collaborators: List[
     # collaborators = workflow["collaborator"]
     workload_path = workflow["workload_path"]
 
-    creator_dataset = get_latest_dataset(workflow_id, creator)
-    creator_key = get_latest_key(workflow_id, creator)
-    collaborator_dataset = []
-    collaborator_key = []
+    creator_datasets = get_all_datasets(workflow_id, creator)
+    creator_keys = get_all_keys(workflow_id, creator)
+
+    datasets = []
+    for ds in creator_datasets:
+        for key in creator_keys:
+            if ds["dataset_id"] == key["dataset_id"]:
+                datasets.append({"owner": creator, "ciphertext_gcs": ds["gcs_path"], "wrapped_dek_gcs": key["gcs_path"]})
+    # for ds, key in zip(creator_datasets, creator_keys):
+    #     datasets.append({"owner": creator, "ciphertext_gcs": ds, "wrapped_dek_gcs": key})
+
     for collaborator in collaborators:
-        if not collaborator.startswith("Client"):
-            raise HTTPException(status_code=400, detail=f"Invalid collaborator ID: {collaborator}")
-        # if collaborator == creator:
-        #     continue        
-        collaborator_dataset.append(get_latest_dataset(workflow_id, collaborator))
-        collaborator_key.append(get_latest_key(workflow_id, collaborator))
+        collab_datasets = get_all_datasets(workflow_id, collaborator)
+        collab_keys = get_all_keys(workflow_id, collaborator)
+        for ds in collab_datasets:
+            for key in collab_keys:
+                if ds["dataset_id"] == key["dataset_id"]:
+                    datasets.append({"owner": creator, "ciphertext_gcs": ds["gcs_path"], "wrapped_dek_gcs": key["gcs_path"]})
+        # for ds, key in zip(collab_datasets, collab_keys):
+        #     datasets.append({"owner": collaborator, "ciphertext_gcs": ds, "wrapped_dek_gcs": key})
 
-    # 2. Download notebook from GCS
-    # bucket_name, workload_obj = workload_path[5:].split("/", 1)
-    # workload_blob = storage_client.bucket(bucket_name).blob(workload_obj)
 
-    # with tempfile.NamedTemporaryFile(suffix=".ipynb", delete=False) as temp_in:
-    #     workload_blob.download_to_filename(temp_in.name)
-    #     input_nb = temp_in.name
-
-    # output_nb = tempfile.NamedTemporaryFile(suffix=".ipynb", delete=False).name
-
-    # result_base = f"gs://{BUCKET}/results/{workflow_id}/result"
-    # executed_notebook_path = f"gs://{BUCKET}/results/{workflow_id}/executed.ipynb"
-
-    # # 3. Execute notebook with parameters
-
-    # prepared_nb = tempfile.NamedTemporaryFile(suffix=".ipynb", delete=False).name
-    # prepare_notebook(
-    #     input_path=input_nb,
-    #     output_path=prepared_nb,
-    #     clientA_path=creator_dataset,
-    #     clientB_path=collaborator_dataset,
-    #     result_base=result_base
-    # )
-
-    # output_nb = tempfile.NamedTemporaryFile(suffix=".ipynb", delete=False).name
-
-    # pm.execute_notebook(
-    #     input_path=prepared_nb,
-    #     output_path=output_nb,
-    #     parameters={
-    #         "clientA_path": creator_dataset,
-    #         "clientB_path": collaborator_dataset,
-    #         "result_base": f"gs://{BUCKET}/results/{workflow_id}/result"
-    #     },
-    #     kernel_name="python3"
-    # )
-
-    # # 4. Upload executed notebook (with outputs) back to GCS
-    # executed_blob = storage_client.bucket(BUCKET).blob(f"results/{workflow_id}/executed.ipynb")
-    # executed_blob.upload_from_filename(output_nb)
-
-    # bucket_name, blob_prefix = result_base[5:].split("/", 1)
-    # bucket = storage_client.bucket(bucket_name)
-
-    # # Look for files with this prefix
-    # blobs = list(bucket.list_blobs(prefix=blob_prefix))
-    # result_blob = next((b for b in blobs if b.name.startswith(blob_prefix)), None)
-
-    # if not result_blob:
-    #     raise HTTPException(status_code=500, detail="Result file not found in GCS")
-
-    # result_gcs_path = f"gs://{bucket_name}/{result_blob.name}"
-
-    if not all([creator_dataset, creator_key, collaborator_dataset, collaborator_key]):
+    if not all([creator_datasets, creator_keys, collab_datasets, collab_keys]):
         raise HTTPException(status_code=400, detail="Missing dataset or key for one of the clients")
     
     result_base = f"gs://{BUCKET}/results/{workflow_id}/result"
     executed_base = f"gs://{BUCKET}/results/{workflow_id}/executed"
-
-    datasets = []
-    datasets.append({"owner": creator, "ciphertext_gcs": creator_dataset, "wrapped_dek_gcs": creator_key})
-    for collaborator, dataset, key in zip(collaborators, collaborator_dataset, collaborator_key):
-        if collaborator == creator:
-            continue
-        datasets.append({"owner": collaborator, "ciphertext_gcs": dataset, "wrapped_dek_gcs": key})
 
     print("Datasets to be sent to executor:", datasets)
 
@@ -432,43 +327,139 @@ def run_notebook(workflow_id: str, creator: str=Query(...), collaborators: List[
     result_info = resp.json()
 
     # 5. Record result in BigQuery
-    table = f"clean-room-exp.cleanroom.results"
+    # table = f"{PROJECT_ID}.cleanroom.results"
 
-    row = {
-        "id": str(uuid.uuid4()),
-        "workflow_id": workflow_id,
-        "executed_notebook_path": result_info["executed_notebook_path"],
-        "result_path": result_info["result_path"],
-        "created_at": f"{datetime.datetime.now()}"
-    }
-    errors = bq_client.insert_rows_json(table, [row])
-    if errors:
-        raise HTTPException(status_code=500, detail=f"Failed to insert result metadata: {errors}")
+    # row = {
+    #     "id": str(uuid.uuid4()),
+    #     "workflow_id": workflow_id,
+    #     "executed_notebook_path": result_info["executed_notebook_path"],
+    #     "result_path": result_info["result_path"],
+    #     "created_at": f"{datetime.datetime.now()}"
+    # }
+    # errors = bq_client.insert_rows_json(table, [row])
+    # if errors:
+    #     raise HTTPException(status_code=500, detail=f"Failed to insert result metadata: {errors}")
+
+    table = f"{PROJECT_ID}.cleanroom.results"
+    rows_to_insert = []
+
+    # Get the list of paths from the executor's response
+    result_paths = result_info.get("result_paths", [])
+    executed_notebook_path = result_info.get("executed_notebook_path")
+    created_time = f"{datetime.datetime.now()}"
+
+    for path in result_paths:
+        row = {
+            "id": str(uuid.uuid4()),
+            "workflow_id": workflow_id,
+            "executed_notebook_path": executed_notebook_path,
+            "result_path": path,
+            "created_at": created_time
+        }
+        rows_to_insert.append(row)
+
+    if rows_to_insert:
+        errors = bq_client.insert_rows_json(table, rows_to_insert)
+        if errors:
+            raise HTTPException(status_code=500, detail=f"Failed to insert result metadata: {errors}")
+
+    # return {
+    #     "status": "success",
+    #     "executed_notebook": result_info["executed_notebook_path"],
+    #     "result_json_path": result_info["result_path"]
+    # }
+    # Check if a trained model zip exists
+    model_gcs_path = None
+    bucket_name, prefix = result_base[5:].split("/", 1)
+    model_blob = storage_client.bucket(bucket_name).blob(prefix + "_model.zip")
+    if model_blob.exists():
+        model_gcs_path = f"gs://{bucket_name}/{prefix}_model.zip"
+
+    # return {
+    #     "status": "success",
+    #     "executed_notebook": result_info["executed_notebook_path"],
+    #     "result_json_path": result_info["result_paths"],
+    #     "model_gcs_path": model_gcs_path   # <--- new field
+    # }
 
     return {
         "status": "success",
-        "executed_notebook": result_info["executed_notebook_path"],
-        "result_json_path": result_info["result_path"]
+        "executed_notebook": result_info.get("executed_notebook_path"),
+        "result_json_paths": result_info.get("result_paths", []), # Use the new plural key
+        "model_gcs_path": model_gcs_path
     }
 
+
+# @app.get("/workflows/{workflow_id}/result")
+# def get_result(workflow_id: str):
+#     query = f"""
+#         SELECT * FROM `{PROJECT_ID}.cleanroom.results`
+#         WHERE workflow_id = @workflow_id
+#         ORDER BY created_at DESC
+#         LIMIT 1
+#     """
+#     job = bq_client.query(
+#         query,
+#         job_config=bigquery.QueryJobConfig(
+#             query_parameters=[bigquery.ScalarQueryParameter("workflow_id", "STRING", workflow_id)]
+#         )
+#     )
+#     rows = list(job.result())
+#     if not rows:
+#         raise HTTPException(status_code=404, detail="No results found for this workflow")
+#     return rows
+
 @app.get("/workflows/{workflow_id}/result")
-def get_result(workflow_id: str):
+def get_all_results(workflow_id: str):
+    """
+    Fetch all result files related to the given workflow_id.
+    It queries BigQuery to find all result entries (paths), then generates signed URLs for each file.
+    """
+
+    # Query BigQuery for all result entries associated with this workflow
     query = f"""
-        SELECT * FROM `{PROJECT_ID}.cleanroom.results`
+        SELECT result_path, executed_notebook_path, created_at
+        FROM `{PROJECT_ID}.cleanroom.results`
         WHERE workflow_id = @workflow_id
         ORDER BY created_at DESC
-        LIMIT 1
     """
     job = bq_client.query(
         query,
         job_config=bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("workflow_id", "STRING", workflow_id)]
-        )
+            query_parameters=[
+                bigquery.ScalarQueryParameter("workflow_id", "STRING", workflow_id)
+            ]
+        ),
     )
+
     rows = list(job.result())
     if not rows:
         raise HTTPException(status_code=404, detail="No results found for this workflow")
-    return rows[0]
+
+    # For each result record, create signed URLs for download
+    results_with_urls = []
+    for row in rows:
+        result_gcs_path = row["result_path"]
+        if not result_gcs_path.startswith("gs://"):
+            continue
+        bucket_name, blob_path = result_gcs_path[5:].split("/", 1)
+        blob = storage_client.bucket(bucket_name).blob(blob_path)
+
+        signed_url = blob.generate_signed_url(
+            version="v4",
+            expiration=datetime.timedelta(minutes=30),
+            method="GET",
+            credentials=creds
+        )
+
+        results_with_urls.append({
+            "result_path": result_gcs_path,
+            "executed_notebook_path": row["executed_notebook_path"],
+            "created_at": row["created_at"].isoformat(),
+            "download_url": signed_url
+        })
+
+    return {"workflow_id": workflow_id, "results": results_with_urls}
 
 @app.get("/executor-pubkey")
 def get_executor_pubkey():
@@ -484,33 +475,13 @@ def get_executor_pubkey():
 
     return resp.json()
 
-# @app.post("/executor-result")
-# async def executor_result(
-#     executed_nb: UploadFile = File(...),
-#     result: UploadFile = File(...),
-#     workflow_id: str = Form(...)
-# ):
-#     bucket = storage_client.bucket(BUCKET)
-#     try:
-#         # Define paths in GCS
-#         executed_path = f"results/{workflow_id}/executed.ipynb"
-#         result_path = f"results/{workflow_id}/{result.filename}"
-
-#         # Upload executed notebook
-#         executed_blob = bucket.blob(executed_path)
-#         executed_blob.upload_from_file(executed_nb.file, content_type="application/x-ipynb+json")
-
-#         # Upload result (dynamic type: json/csv/txt/etc.)
-#         result_blob = bucket.blob(result_path)
-#         result_blob.upload_from_file(result.file, content_type="application/octet-stream")
-
-#         return {
-#             "status": "success",
-#             "workflow_id": workflow_id,
-#             "executed_notebook_path": f"gs://{BUCKET}/{executed_path}",
-#             "result_path": f"gs://{BUCKET}/{result_path}",
-#         }
-
-#     except Exception as e:
-#         # log.exception("Executor result upload failed")
-#         raise HTTPException(status_code=500, detail=str(e))
+@app.get("/logs/{workflow_id}")
+def workflow_logs(workflow_id: str):
+    # forward the request to executor
+    executor_url = f"{EXECUTOR_URL}/logs/{workflow_id}"
+    try:
+        resp = requests.get(executor_url)
+        # return resp.text, resp.status_code
+        return resp.json()
+    except Exception as e:
+        return f"Error contacting executor: {e}", 500
