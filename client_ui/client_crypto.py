@@ -20,12 +20,15 @@ def get_executor_pubkey():
     pubkey_pem = resp.json()["public_key_pem"]
     return serialization.load_pem_public_key(pubkey_pem.encode())
 
-def encrypt_and_upload(workflow_id, pubkey, local_file, owner):
+def encrypt_and_upload(workflow_id, pubkey, local_file, filename, owner):
     """Encrypt dataset, wrap DEK, upload both via orchestrator signed URLs."""
-    # Generate DEK
-    WORKFLOW_ID = workflow_id
-    if WORKFLOW_ID is None:
+    if workflow_id is None:
         raise ValueError("workflow_id must be provided")
+    
+    # Generate dataset_id for uniqueness
+    dataset_id = str(uuid.uuid4())
+
+    # Generate DEK
     dek = AESGCM.generate_key(bit_length=256)
 
     # Encrypt dataset
@@ -44,18 +47,16 @@ def encrypt_and_upload(workflow_id, pubkey, local_file, owner):
         padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
     )
 
-    # Ask orchestrator for signed upload URLs
-    dataset_id = str(uuid.uuid4())
-
+    # Ask orchestrator for signed upload URLs (ciphertext + key), including dataset_id
     resp_cipher = requests.post(
         f"{ORCHESTRATOR_URL}/upload-url",
-        params={"workflow_id": workflow_id, "file_type": "dataset", "owner": owner}
+        params={"workflow_id": workflow_id, "dataset_id": dataset_id, "filename": filename, "file_type": "dataset", "owner": owner}
     ).json()
     cipher_url, cipher_gcs = resp_cipher["upload_url"], resp_cipher["gcs_path"]
 
     resp_dek = requests.post(
         f"{ORCHESTRATOR_URL}/upload-url",
-        params={"workflow_id": workflow_id, "file_type": "key", "owner": f"{owner}"}
+        params={"workflow_id": workflow_id, "dataset_id": dataset_id, "filename": filename, "file_type": "key", "owner": owner}
     ).json()
     dek_url, dek_gcs = resp_dek["upload_url"], resp_dek["gcs_path"]
 
@@ -69,14 +70,17 @@ def encrypt_and_upload(workflow_id, pubkey, local_file, owner):
     if put2.status_code != 200:
         raise RuntimeError(f"Wrapped DEK upload failed: {put2.text}")
 
-    print("✅ Encrypted dataset + DEK uploaded successfully")
+    print(f"✅ Uploaded dataset {dataset_id} for workflow {workflow_id}")
+
     return {
+        "workflow_id": workflow_id,
+        "filename": filename,
+        "dataset_id": dataset_id,
         "owner": owner,
         "ciphertext_gcs": cipher_gcs,
         "wrapped_dek_gcs": dek_gcs,
-        "upload_status_dataset" : put1.status_code,
-        "upload_status_dek" : put2.status_code,
-        "encrypted_dataset": ciphertext[:128].hex()
+        "upload_status_dataset": put1.status_code,
+        "upload_status_dek": put2.status_code
     }
 
 if __name__ == "__main__":
