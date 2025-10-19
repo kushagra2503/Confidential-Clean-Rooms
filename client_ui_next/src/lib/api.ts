@@ -49,6 +49,7 @@ api.interceptors.response.use(
   }
 );
 
+
 // Workflow API
 export const workflowApi = {
   // Create a new workflow
@@ -63,7 +64,7 @@ export const workflowApi = {
     });
 
     // Add collaborators as separate parameters
-    collaborators.forEach((collaborator, index) => {
+    collaborators.forEach((collaborator) => {
       params.append('collaborator', collaborator);
     });
 

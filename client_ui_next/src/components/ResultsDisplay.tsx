@@ -207,70 +207,108 @@ export function ResultsDisplay({ results }: ResultsDisplayProps) {
   }
 
   return (
-    <div>
-      <div className="flex items-center space-x-2 mb-6">
-        <BarChartIcon className="w-5 h-5 text-gray-600" />
-        <h3 className="text-lg font-semibold">Workflow Results</h3>
+    <div className="space-y-8">
+      <div className="flex items-center space-x-4">
+        <div className="bg-gradient-to-r from-emerald-500 to-green-500 p-3 rounded-xl shadow-lg">
+          <BarChartIcon className="w-6 h-6 text-white" />
+        </div>
+        <div>
+          <h3 className="text-2xl font-bold gradient-text">Workflow Results</h3>
+          <p className="text-gray-600">Analysis outputs and generated insights</p>
+        </div>
       </div>
 
-      <div className="space-y-4">
+      <div className="space-y-6">
         {displayResults.map((result) => {
           const fileName = result.result_path.split('/').pop() || 'Unknown File';
           const isExpanded = expandedResults.has(result.result_path);
+          const fileExtension = fileName.split('.').pop()?.toLowerCase();
+
+          // Determine file type icon and color
+          const getFileTypeInfo = (extension: string) => {
+            switch (extension) {
+              case 'json':
+                return { icon: '📊', color: 'from-blue-500 to-indigo-500', label: 'Metrics' };
+              case 'csv':
+                return { icon: '📋', color: 'from-emerald-500 to-green-500', label: 'Dataset' };
+              default:
+                return { icon: '📄', color: 'from-slate-500 to-gray-500', label: 'File' };
+            }
+          };
+
+          const fileTypeInfo = getFileTypeInfo(fileExtension || '');
 
           return (
-            <div key={result.result_path} className="border border-gray-200 rounded-lg overflow-hidden">
+            <div key={result.result_path} className="card-subtle overflow-hidden hover:shadow-xl transition-all duration-300">
               {/* Header */}
               <div
-                className="bg-gray-50 px-4 py-3 cursor-pointer hover:bg-gray-100 transition-colors"
+                className="px-6 py-4 cursor-pointer hover:bg-white/50 transition-all duration-200"
                 onClick={() => toggleExpanded(result.result_path)}
               >
                 <div className="flex items-center justify-between">
-                  <div className="flex items-center space-x-3">
-                    {isExpanded ? (
-                      <ChevronDownIcon className="w-4 h-4 text-gray-500" />
-                    ) : (
-                      <ChevronRightIcon className="w-4 h-4 text-gray-500" />
-                    )}
-                    <FileIcon className="w-4 h-4 text-blue-600" />
-                    <div>
-                      <h4 className="font-medium text-gray-900">{fileName}</h4>
-                      <p className="text-sm text-gray-500">
-                        Created: {new Date(result.created_at).toLocaleString()}
+                  <div className="flex items-center space-x-4">
+                    <div className={`bg-gradient-to-r ${fileTypeInfo.color} p-3 rounded-xl shadow-md`}>
+                      <span className="text-2xl">{fileTypeInfo.icon}</span>
+                    </div>
+                    <div className="flex-1">
+                      <div className="flex items-center space-x-3 mb-1">
+                        <h4 className="font-bold text-gray-800 text-lg">{fileName}</h4>
+                        <span className="status-badge status-info text-xs">{fileTypeInfo.label}</span>
+                      </div>
+                      <p className="text-gray-600 text-sm">
+                        Generated {new Date(result.created_at).toLocaleString()}
                       </p>
                     </div>
                   </div>
 
-                  <div className="flex items-center space-x-2">
+                  <div className="flex items-center space-x-3">
                     {result.download_url && (
                       <a
                         href={result.download_url}
                         download={fileName}
-                        className="btn-secondary text-xs px-3 py-1"
+                        className="btn-secondary text-sm px-4 py-2"
                         onClick={(e) => e.stopPropagation()}
                       >
-                        <DownloadIcon className="w-3 h-3 mr-1" />
+                        <DownloadIcon className="w-4 h-4 mr-2" />
                         Download
                       </a>
                     )}
+                    <div className="text-gray-400">
+                      {isExpanded ? (
+                        <ChevronDownIcon className="w-5 h-5" />
+                      ) : (
+                        <ChevronRightIcon className="w-5 h-5" />
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
 
               {/* Content */}
               {isExpanded && (
-                <div className="p-4 bg-white">
+                <div className="px-6 py-6 bg-gradient-to-r from-slate-50 to-blue-50 border-t border-white/20">
                   {result.error ? (
-                    <div className="text-red-600 text-sm bg-red-50 p-3 rounded">
-                      Error loading content: {result.error}
+                    <div className="bg-gradient-to-r from-red-50 to-rose-50 border-2 border-red-200 rounded-xl p-4">
+                      <div className="flex items-center space-x-3">
+                        <div className="bg-red-100 p-2 rounded-lg">
+                          <span className="text-red-600 text-lg">⚠️</span>
+                        </div>
+                        <div>
+                          <p className="font-semibold text-red-800">Error Loading Content</p>
+                          <p className="text-red-600 text-sm">{result.error}</p>
+                        </div>
+                      </div>
                     </div>
                   ) : result.isLoading ? (
-                    <div className="text-center py-8">
-                      <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto"></div>
-                      <p className="text-gray-500 mt-2">Loading content...</p>
+                    <div className="text-center py-12">
+                      <div className="mb-4">
+                        <div className="animate-spin rounded-full h-12 w-12 border-4 border-blue-200 border-t-blue-600 mx-auto"></div>
+                      </div>
+                      <p className="text-gray-600 font-medium">Loading file content...</p>
+                      <p className="text-gray-500 text-sm mt-1">Fetching data from secure storage</p>
                     </div>
                   ) : result.content ? (
-                    <div>
+                    <div className="space-y-6">
                       {/* Render metrics for JSON with numeric values */}
                       {fileName.endsWith('.json') && result.content && typeof result.content === 'object' && renderMetrics(result.content as Record<string, unknown>)}
 
@@ -284,12 +322,19 @@ export function ResultsDisplay({ results }: ResultsDisplayProps) {
                       {typeof result.content === 'string' && renderTextContent(result.content)}
                     </div>
                   ) : (
-                    <div className="text-center py-8">
+                    <div className="text-center py-12">
+                      <div className="mb-6">
+                        <div className="bg-gradient-to-r from-blue-100 to-indigo-100 p-4 rounded-2xl inline-block">
+                          <FileIcon className="w-12 h-12 text-blue-600 animate-float" />
+                        </div>
+                        <h4 className="text-lg font-semibold text-gray-800 mt-4 mb-2">Content Not Loaded</h4>
+                        <p className="text-gray-600">Click to load and preview this file</p>
+                      </div>
                       <button
                         onClick={() => loadResultContent(result)}
-                        className="btn-primary"
+                        className="btn-primary px-8 py-3 text-lg"
                       >
-                        Load Content
+                        📂 Load File Content
                       </button>
                     </div>
                   )}

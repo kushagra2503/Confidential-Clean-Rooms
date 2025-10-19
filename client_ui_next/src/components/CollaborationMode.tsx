@@ -1,27 +1,33 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { useAppState, appActions } from '@/hooks/useAppState';
-import { workflowApi, logsApi } from '@/lib/api';
-import { encryptAndUploadDataset } from '@/lib/crypto';
-import { FileUpload } from './FileUpload';
-import { ExecutionLogs } from './ExecutionLogs';
-import { ResultsDisplay } from './ResultsDisplay';
+import React, { useState, useEffect } from 'react';
 import {
   PlusIcon,
   PlayIcon,
   RefreshCwIcon,
   CheckCircleIcon,
   UserIcon,
-  UsersIcon
+  UsersIcon,
+  DatabaseIcon,
+  FileIcon,
+  TrashIcon
 } from 'lucide-react';
+import { useAppState, appActions } from '../hooks/useAppState';
+import { encryptAndUploadDataset } from '../lib/crypto';
+import { workflowApi, attestationApi, logsApi } from '../lib/api';
+import { FileUpload } from './FileUpload';
+import { ExecutionLogs } from './ExecutionLogs';
+import { ResultsDisplay } from './ResultsDisplay';
 
 export function CollaborationMode() {
   const { state, dispatch } = useAppState();
-  const [activeView, setActiveView] = useState<'creator' | 'collaborator'>('creator');
-  const [collaborators, setCollaborators] = useState('');
+  const [role, setRole] = useState<'Creator' | 'Collaborator'>('Creator');
+  const [creatorId, setCreatorId] = useState('Auditor');
+  const [collaboratorId, setCollaboratorId] = useState('ClientB');
+  const [collaborators, setCollaborators] = useState('ClientB');
   const [existingWorkflowId, setExistingWorkflowId] = useState('');
   const [joinWorkflowId, setJoinWorkflowId] = useState('');
+  const [workflowToRun, setWorkflowToRun] = useState('');
   const [isCreatingWorkflow, setIsCreatingWorkflow] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
@@ -29,30 +35,56 @@ export function CollaborationMode() {
   const [executionStarted, setExecutionStarted] = useState(false);
   const [logsPolling, setLogsPolling] = useState(false);
 
+  // Poll logs function
+  const pollLogs = async (workflowId: string) => {
+    const poll = async () => {
+      if (!logsPolling) return;
+
+      try {
+        const response = await logsApi.getWorkflowLogs(workflowId);
+        dispatch(appActions.setExecutionLogs(response.logs));
+
+        // Continue polling if not completed
+        if (!response.logs.some((log: string) => log.includes('Notebook executed'))) {
+          setTimeout(poll, 2000);
+        } else {
+          setLogsPolling(false);
+          // Fetch results when execution is complete
+          try {
+            const results = await workflowApi.getWorkflowResults(workflowId);
+            dispatch(appActions.setResults(results.results));
+          } catch (error) {
+            console.error('Failed to fetch results:', error);
+          }
+        }
+      } catch (error) {
+        console.error('Failed to poll logs:', error);
+        setTimeout(poll, 2000);
+      }
+    };
+
+    poll();
+  };
+
+  // Cleanup polling on unmount
+  useEffect(() => {
+    return () => {
+      setLogsPolling(false);
+    };
+  }, []);
+
   // Creator: Create new workflow
   const handleCreateWorkflow = async () => {
-    if (!state.currentUser) return;
-
     setIsCreatingWorkflow(true);
     try {
       const workflowId = crypto.randomUUID();
-      const collaboratorList = collaborators
-        .split(',')
-        .map(c => c.trim())
-        .filter(c => c.length > 0);
-
-      const response = await workflowApi.createWorkflow(
-        workflowId,
-        state.currentUser,
-        [state.currentUser, ...collaboratorList]
-      );
-
       dispatch(appActions.setWorkflowId(workflowId));
       dispatch(appActions.setWorkflowStatus('PENDING_APPROVAL'));
       dispatch(appActions.clearUploadedDatasets());
       dispatch(appActions.clearExecutionLogs());
       dispatch(appActions.clearResults());
       setExecutionStarted(false);
+      alert(`Workflow created with ID: ${workflowId}`);
     } catch (error) {
       console.error('Failed to create workflow:', error);
       alert('Failed to create workflow. Please try again.');
@@ -61,30 +93,28 @@ export function CollaborationMode() {
     }
   };
 
-  // Creator: Use existing workflow
-  const handleUseExistingWorkflow = () => {
-    if (existingWorkflowId.trim()) {
-      dispatch(appActions.setWorkflowId(existingWorkflowId.trim()));
-      dispatch(appActions.setWorkflowStatus('PENDING_APPROVAL'));
-      dispatch(appActions.clearUploadedDatasets());
-      dispatch(appActions.clearExecutionLogs());
-      dispatch(appActions.clearResults());
-      setExecutionStarted(false);
-    }
-  };
-
-  // Creator/Collaborator: Handle file uploads
-  const handleFilesSelected = async (files: File[]) => {
-    if (!state.currentWorkflowId || !state.currentUser) return;
+  // Creator: Handle file uploads and workflow submission
+  const handleCreatorUploadDatasets = async (files: File[]) => {
+    if (!state.currentWorkflowId) return;
 
     setIsUploading(true);
     try {
+      // Get executor public key
+      const pubkey = await attestationApi.getExecutorPubkey();
+
+      const uploadedPaths: string[] = [];
+
+      // Encrypt and upload each dataset
       for (const file of files) {
-        await encryptAndUploadDataset(
+        const result = await encryptAndUploadDataset(
           state.currentWorkflowId,
           file,
-          state.currentUser
+          creatorId
         );
+
+        if (result.upload_status_dataset === 200) {
+          uploadedPaths.push(result.ciphertext_gcs);
+        }
 
         dispatch(appActions.addUploadedDataset({
           name: file.name,
@@ -92,6 +122,10 @@ export function CollaborationMode() {
           type: file.type,
           file: file,
         }));
+      }
+
+      if (uploadedPaths.length > 0) {
+        alert(`Uploaded ${uploadedPaths.length} encrypted datasets ✅`);
       }
     } catch (error) {
       console.error('Failed to upload files:', error);
@@ -103,50 +137,58 @@ export function CollaborationMode() {
 
   // Creator: Submit workflow for approval
   const handleSubmitWorkflow = async () => {
-    if (!state.currentWorkflowId || !state.currentUser) return;
+    if (!state.currentWorkflowId) return;
 
     try {
-      await workflowApi.approveWorkflow(state.currentWorkflowId, state.currentUser);
-      dispatch(appActions.setWorkflowStatus('APPROVED_BY_CREATOR'));
+      const collaboratorList = [creatorId, ...collaborators.split(',').map(c => c.trim()).filter(c => c.length > 0)];
+
+      // Submit workflow to orchestrator
+      await workflowApi.createWorkflow(
+        state.currentWorkflowId,
+        creatorId,
+        collaboratorList
+      );
+
+      // Auto-approve creator
+      await workflowApi.approveWorkflow(state.currentWorkflowId, creatorId);
+
+      alert('Workflow submitted ✅ Waiting for collaborator approvals.');
     } catch (error) {
       console.error('Failed to submit workflow:', error);
-      alert('Failed to submit workflow. Please try again.');
+      alert('Error submitting workflow. Please try again.');
     }
   };
 
   // Creator: Run collaborative workflow
   const handleRunWorkflow = async () => {
-    if (!state.currentWorkflowId || !state.currentUser) return;
+    const workflowIdToRun = workflowToRun || state.currentWorkflowId;
+    if (!workflowIdToRun) return;
 
-    const collaboratorList = collaborators
-      .split(',')
-      .map(c => c.trim())
-      .filter(c => c.length > 0);
+    const collaboratorList = [creatorId, ...collaborators.split(',').map(c => c.trim()).filter(c => c.length > 0)];
 
     setIsRunning(true);
     setExecutionStarted(true);
     dispatch(appActions.clearExecutionLogs());
 
     try {
-      await workflowApi.runWorkflow(
-        state.currentWorkflowId,
-        state.currentUser,
-        [state.currentUser, ...collaboratorList]
+      const response = await workflowApi.runWorkflow(
+        workflowIdToRun,
+        creatorId,
+        collaboratorList
       );
 
       dispatch(appActions.setWorkflowStatus('RUNNING'));
 
       // Start polling logs
       setLogsPolling(true);
-      pollLogs();
+      pollLogs(workflowIdToRun);
 
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to run workflow:', error);
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      if (errorMessage.includes('not yet approved')) {
-        alert('Workflow is not approved by all collaborators yet.');
+      if (error.message?.includes('not yet approved')) {
+        alert('⚠️ Workflow not yet approved by all collaborators.');
       } else {
-        alert('Failed to run workflow. Please try again.');
+        alert('Execution failed. Please try again.');
       }
       setExecutionStarted(false);
     } finally {
@@ -155,20 +197,38 @@ export function CollaborationMode() {
   };
 
   // Collaborator: Join and approve workflow
-  const handleJoinWorkflow = async () => {
-    if (!joinWorkflowId.trim() || !state.currentUser) return;
+  const handleJoinWorkflow = async (files: File[]) => {
+    if (!joinWorkflowId.trim()) return;
 
     setIsApproving(true);
     try {
-      // First upload datasets
-      // Note: In a real app, collaborator would have their own datasets
+      // Upload datasets if provided
+      if (files.length > 0) {
+        const pubkey = await attestationApi.getExecutorPubkey();
 
-      // Then approve the workflow
-      await workflowApi.approveWorkflow(joinWorkflowId.trim(), state.currentUser);
+        for (const file of files) {
+          await encryptAndUploadDataset(
+            joinWorkflowId.trim(),
+            file,
+            collaboratorId
+          );
+
+          dispatch(appActions.addUploadedDataset({
+            name: file.name,
+            size: file.size,
+            type: file.type,
+            file: file,
+          }));
+        }
+      }
+
+      // Approve workflow
+      await workflowApi.approveWorkflow(joinWorkflowId.trim(), collaboratorId);
 
       dispatch(appActions.setWorkflowId(joinWorkflowId.trim()));
       dispatch(appActions.setWorkflowStatus('APPROVED'));
-      alert('Successfully joined and approved the workflow!');
+
+      alert('Workflow approved with your datasets ✅');
     } catch (error) {
       console.error('Failed to join workflow:', error);
       alert('Failed to join workflow. Please check the workflow ID and try again.');
@@ -177,245 +237,235 @@ export function CollaborationMode() {
     }
   };
 
-  // Poll logs
-  const pollLogs = async () => {
-    if (!state.currentWorkflowId) return;
-
-    try {
-      const logsResponse = await logsApi.getWorkflowLogs(state.currentWorkflowId);
-      dispatch(appActions.setExecutionLogs(logsResponse.logs));
-
-      // Check if execution is complete
-      const hasCompleted = logsResponse.logs.some(log =>
-        log.includes('Notebook executed') || log.includes('Execution finished')
-      );
-
-      if (hasCompleted) {
-        setLogsPolling(false);
-        dispatch(appActions.setWorkflowStatus('COMPLETED'));
-
-        // Fetch results
-        try {
-          const resultsResponse = await workflowApi.getWorkflowResults(state.currentWorkflowId);
-          dispatch(appActions.setResults(resultsResponse.results));
-        } catch (resultsError) {
-          console.error('Failed to fetch results:', resultsError);
-        }
-      } else {
-        // Continue polling
-        setTimeout(pollLogs, 2000);
-      }
-    } catch (error) {
-      console.error('Failed to poll logs:', error);
-      setTimeout(pollLogs, 2000);
-    }
-  };
-
-  // Stop polling when component unmounts
-  useEffect(() => {
-    return () => {
-      setLogsPolling(false);
-    };
-  }, []);
-
   return (
-    <div className="space-y-6">
-      {/* Role Selection */}
-      <div className="flex space-x-1 bg-gray-100 p-1 rounded-lg">
-        <button
-          onClick={() => setActiveView('creator')}
-          className={`flex-1 flex items-center justify-center space-x-2 py-2 px-4 rounded-md font-medium transition-colors ${
-            activeView === 'creator'
-              ? 'bg-blue-600 text-white'
-              : 'text-gray-600 hover:bg-gray-200'
-          }`}
-        >
-          <UserIcon className="w-4 h-4" />
-          <span>Creator</span>
-        </button>
-        <button
-          onClick={() => setActiveView('collaborator')}
-          className={`flex-1 flex items-center justify-center space-x-2 py-2 px-4 rounded-md font-medium transition-colors ${
-            activeView === 'collaborator'
-              ? 'bg-blue-600 text-white'
-              : 'text-gray-600 hover:bg-gray-200'
-          }`}
-        >
-          <UsersIcon className="w-4 h-4" />
-          <span>Collaborator</span>
-        </button>
-      </div>
+    <div className="space-y-8">
+      <div className="card-subtle">
+        <div className="flex items-center space-x-3 mb-6">
+          <div className="bg-gradient-to-r from-purple-500 to-indigo-500 p-3 rounded-xl">
+            <UsersIcon className="w-6 h-6 text-white" />
+          </div>
+          <div>
+            <h2 className="text-2xl font-bold gradient-text">Collaborative Workflow</h2>
+            <p className="text-gray-600">Secure multi-party machine learning workflows</p>
+          </div>
+        </div>
 
-      {/* Creator View */}
-      {activeView === 'creator' && (
-        <div className="space-y-6">
-          <div className="card">
-            <h2 className="text-xl font-semibold mb-4">Creator Dashboard</h2>
+        {/* Role Selection */}
+        <div className="mb-6">
+          <label className="block text-sm font-semibold text-gray-700 mb-3">
+            Select Your Role
+          </label>
+          <div className="flex space-x-4">
+            <label className="flex items-center">
+              <input
+                type="radio"
+                value="Creator"
+                checked={role === 'Creator'}
+                onChange={(e) => setRole(e.target.value as 'Creator' | 'Collaborator')}
+                className="mr-3"
+              />
+              <div className="flex items-center space-x-2">
+                <UserIcon className="w-5 h-5 text-blue-600" />
+                <span className="font-medium">Creator</span>
+              </div>
+            </label>
+            <label className="flex items-center">
+              <input
+                type="radio"
+                value="Collaborator"
+                checked={role === 'Collaborator'}
+                onChange={(e) => setRole(e.target.value as 'Creator' | 'Collaborator')}
+                className="mr-3"
+              />
+              <div className="flex items-center space-x-2">
+                <UsersIcon className="w-5 h-5 text-green-600" />
+                <span className="font-medium">Collaborator</span>
+              </div>
+            </label>
+          </div>
+        </div>
+
+        {/* Creator View */}
+        {role === 'Creator' && (
+          <div>
+            <div className="mb-4">
+              <label htmlFor="creatorId" className="block text-sm font-medium text-gray-700 mb-2">
+                Your ID (Creator)
+              </label>
+              <input
+                id="creatorId"
+                type="text"
+                value={creatorId}
+                onChange={(e) => setCreatorId(e.target.value)}
+                className="input-field"
+                placeholder="Enter your creator ID"
+              />
+            </div>
 
             {/* Workflow Setup */}
-            {!state.currentWorkflowId ? (
-              <div className="space-y-4">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <button
-                    onClick={handleCreateWorkflow}
-                    disabled={isCreatingWorkflow}
-                    className="btn-primary flex items-center justify-center space-x-2"
-                  >
-                    {isCreatingWorkflow ? (
-                      <RefreshCwIcon className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <PlusIcon className="w-4 h-4" />
-                    )}
-                    <span>Create New Workflow</span>
-                  </button>
+            <div className="mb-6">
+              <h3 className="text-lg font-semibold mb-4">Workflow Setup</h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                <button
+                  onClick={handleCreateWorkflow}
+                  disabled={isCreatingWorkflow}
+                  className="btn-primary flex items-center justify-center space-x-2"
+                >
+                  <PlusIcon className="w-4 h-4" />
+                  <span>🆕 Create New Workflow</span>
+                </button>
 
-                  <div className="space-y-2">
-                    <input
-                      type="text"
-                      placeholder="Enter existing workflow ID"
-                      value={existingWorkflowId}
-                      onChange={(e) => setExistingWorkflowId(e.target.value)}
-                      className="input-field"
-                    />
-                    <button
-                      onClick={handleUseExistingWorkflow}
-                      disabled={!existingWorkflowId.trim()}
-                      className="btn-secondary w-full"
-                    >
-                      Use Existing Workflow
-                    </button>
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Collaborators (comma-separated)
-                  </label>
+                <div className="space-y-2">
                   <input
                     type="text"
-                    placeholder="e.g., ClientB, ClientC, ClientD"
-                    value={collaborators}
-                    onChange={(e) => setCollaborators(e.target.value)}
+                    placeholder="Or enter existing Workflow ID to continue"
+                    value={existingWorkflowId}
+                    onChange={(e) => setExistingWorkflowId(e.target.value)}
                     className="input-field"
                   />
+                  {existingWorkflowId && (
+                    <p className="text-sm text-blue-600">Using existing workflow: {existingWorkflowId}</p>
+                  )}
                 </div>
               </div>
-            ) : (
-              <div className="space-y-4">
-                <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-                  <p className="font-medium text-blue-800">
-                    Workflow ID: <code className="bg-blue-100 px-2 py-1 rounded text-sm">{state.currentWorkflowId}</code>
-                  </p>
-                  <p className="text-blue-600 text-sm mt-1">
-                    Status: {state.workflowStatus || 'Ready'}
-                  </p>
-                  <p className="text-blue-600 text-sm">
-                    Collaborators: {state.currentUser}, {collaborators}
-                  </p>
-                </div>
 
-                {/* File Upload */}
-                <div>
-                  <h3 className="font-medium mb-3">Upload Your Datasets</h3>
-                  <FileUpload
-                    onFilesSelected={handleFilesSelected}
-                    uploadedFiles={state.uploadedDatasets}
+              {/* Upload creator datasets */}
+              {state.currentWorkflowId && (
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Add Collaborator IDs (comma-separated)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="ClientB"
+                      value={collaborators}
+                      onChange={(e) => setCollaborators(e.target.value)}
+                      className="input-field"
+                    />
+                  </div>
+
+                  <div>
+                    <h4 className="font-medium mb-3">Upload one or more datasets (CSV)</h4>
+                    <FileUpload
+                      onFilesSelected={handleCreatorUploadDatasets}
+                      uploadedFiles={state.uploadedDatasets}
+                      acceptOnlyCsv={true}
+                    />
+                  </div>
+
+                  {/* Submit workflow */}
+                  {state.uploadedDatasets.length > 0 && (
+                    <div className="pt-4 border-t border-gray-200">
+                      <button
+                        onClick={handleSubmitWorkflow}
+                        className="btn-success flex items-center space-x-2"
+                      >
+                        <CheckCircleIcon className="w-4 h-4" />
+                        <span>Submit Workflow</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Run approved workflow */}
+            {state.currentWorkflowId && (
+              <div className="mb-6">
+                <h3 className="text-lg font-semibold mb-4">▶️ Run Approved Workflow</h3>
+                <div className="space-y-4">
+                  <input
+                    type="text"
+                    placeholder="Enter Workflow ID to Run"
+                    value={workflowToRun}
+                    onChange={(e) => setWorkflowToRun(e.target.value)}
+                    className="input-field"
                   />
-                </div>
 
-                {/* Submit for Approval */}
+                  <button
+                    onClick={handleRunWorkflow}
+                    disabled={isRunning}
+                    className="btn-success flex items-center space-x-3 w-full justify-center py-4 text-lg"
+                  >
+                    {isRunning ? (
+                      <RefreshCwIcon className="w-5 h-5 animate-spin" />
+                    ) : (
+                      <PlayIcon className="w-5 h-5" />
+                    )}
+                    <span>Run Collaborative Workflow</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Collaborator View */}
+        {role === 'Collaborator' && (
+          <div>
+            <div className="mb-4">
+              <label htmlFor="collaboratorId" className="block text-sm font-medium text-gray-700 mb-2">
+                Your ID (Collaborator)
+              </label>
+              <input
+                id="collaboratorId"
+                type="text"
+                value={collaboratorId}
+                onChange={(e) => setCollaboratorId(e.target.value)}
+                className="input-field"
+                placeholder="Enter your collaborator ID"
+              />
+            </div>
+
+            <div className="mb-4">
+              <label htmlFor="workflowId" className="block text-sm font-medium text-gray-700 mb-2">
+                Workflow ID to join
+              </label>
+              <input
+                id="workflowId"
+                type="text"
+                value={joinWorkflowId}
+                onChange={(e) => setJoinWorkflowId(e.target.value)}
+                className="input-field"
+                placeholder="Enter workflow ID from creator"
+              />
+            </div>
+
+            {joinWorkflowId && (
+              <div>
+                <h4 className="font-medium mb-3">Upload your encrypted datasets (CSV)</h4>
+                <FileUpload
+                  onFilesSelected={(files) => handleJoinWorkflow(files)}
+                  uploadedFiles={state.uploadedDatasets}
+                  acceptOnlyCsv={true}
+                />
+
                 {state.uploadedDatasets.length > 0 && (
-                  <div className="pt-4 border-t">
+                  <div className="mt-4">
                     <button
-                      onClick={handleSubmitWorkflow}
-                      className="btn-success flex items-center space-x-2 mr-4"
+                      onClick={() => handleJoinWorkflow([])}
+                      disabled={isApproving}
+                      className="btn-primary flex items-center space-x-2"
                     >
-                      <CheckCircleIcon className="w-4 h-4" />
-                      <span>Submit for Approval</span>
+                      {isApproving ? (
+                        <RefreshCwIcon className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <CheckCircleIcon className="w-4 h-4" />
+                      )}
+                      <span>Approve & Upload Datasets</span>
                     </button>
                   </div>
                 )}
               </div>
             )}
+
+            {!joinWorkflowId && (
+              <p className="text-gray-500 text-sm">Enter a Workflow ID to join and upload your data.</p>
+            )}
           </div>
-
-          {/* Run Workflow */}
-          {state.currentWorkflowId && state.workflowStatus?.includes('APPROVED') && (
-            <div className="card">
-              <h3 className="text-lg font-semibold mb-4">Run Collaborative Workflow</h3>
-              <button
-                onClick={handleRunWorkflow}
-                disabled={isRunning}
-                className="btn-success flex items-center space-x-2"
-              >
-                {isRunning ? (
-                  <RefreshCwIcon className="w-4 h-4 animate-spin" />
-                ) : (
-                  <PlayIcon className="w-4 h-4" />
-                )}
-                <span>Run Fraud Detection</span>
-              </button>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Collaborator View */}
-      {activeView === 'collaborator' && (
-        <div className="card">
-          <h2 className="text-xl font-semibold mb-4">Collaborator Dashboard</h2>
-
-          {!state.currentWorkflowId ? (
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Workflow ID to Join
-                </label>
-                <input
-                  type="text"
-                  placeholder="Enter workflow ID from creator"
-                  value={joinWorkflowId}
-                  onChange={(e) => setJoinWorkflowId(e.target.value)}
-                  className="input-field"
-                />
-              </div>
-
-              <button
-                onClick={handleJoinWorkflow}
-                disabled={!joinWorkflowId.trim() || isApproving}
-                className="btn-primary flex items-center space-x-2"
-              >
-                {isApproving ? (
-                  <RefreshCwIcon className="w-4 h-4 animate-spin" />
-                ) : (
-                  <CheckCircleIcon className="w-4 h-4" />
-                )}
-                <span>Join & Approve Workflow</span>
-              </button>
-            </div>
-          ) : (
-            <div className="space-y-4">
-              <div className="bg-green-50 border border-green-200 rounded-lg p-4">
-                <p className="font-medium text-green-800">
-                  Successfully joined workflow: <code className="bg-green-100 px-2 py-1 rounded text-sm">{state.currentWorkflowId}</code>
-                </p>
-                <p className="text-green-600 text-sm mt-1">
-                  Status: {state.workflowStatus || 'Approved'}
-                </p>
-              </div>
-
-              {/* File Upload for Collaborator */}
-              <div>
-                <h3 className="font-medium mb-3">Upload Your Datasets</h3>
-                <FileUpload
-                  onFilesSelected={handleFilesSelected}
-                  uploadedFiles={state.uploadedDatasets}
-                />
-              </div>
-            </div>
-          )}
-        </div>
-      )}
+        )}
+      </div>
 
       {/* Execution Logs */}
       {executionStarted && (
@@ -424,7 +474,7 @@ export function CollaborationMode() {
         </div>
       )}
 
-      {/* Results */}
+      {/* Results Display */}
       {state.results.length > 0 && (
         <div className="card">
           <ResultsDisplay results={state.results} />

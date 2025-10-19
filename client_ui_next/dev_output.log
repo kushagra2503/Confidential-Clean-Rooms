@@ -1,0 +1,20 @@
+
+> client_ui_next@0.1.0 dev
+> next dev
+
+ ⚠ Invalid next.config.js options detected: 
+ ⚠     Unrecognized key(s) in object: 'serverComponentsExternalPackages' at "experimental"
+ ⚠     Unrecognized key(s) in object: 'server', 'telemetry'
+ ⚠ See more info here: https://nextjs.org/docs/messages/invalid-next-config
+ ⚠ `experimental.serverComponentsExternalPackages` has been moved to `serverExternalPackages`. Please update your next.config.js file accordingly.
+ ⨯ Failed to start server
+Error: listen EPERM: operation not permitted 0.0.0.0:3000
+    at <unknown> (Error: listen EPERM: operation not permitted 0.0.0.0:3000)
+    at new Promise (<anonymous>) {
+  code: 'EPERM',
+  errno: -1,
+  syscall: 'listen',
+  address: '0.0.0.0',
+  port: 3000
+}
+[?25h
